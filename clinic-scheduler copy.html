@@ -1,0 +1,1698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FMC Clinic Scheduler</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.3/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #F1F5F9; min-height: 100vh; color: #1e293b; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { text-align: left; }
+    input, textarea, select { font-family: inherit; }
+    .spin { animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+  // Set up PDF.js worker
+  if (typeof pdfjsLib !== 'undefined') {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+</script>
+<script type="text/babel">
+const { useState, useMemo, useCallback, useRef, useEffect } = React;
+
+// ═══════════════════════════════════════════════════════════════════
+//  CONSTANTS
+// ═══════════════════════════════════════════════════════════════════
+const MONTH_MAP = { JAN:0, FEB:1, MAR:2, APR:3, MAY:4, JUN:5,
+                    JUL:6, AUG:7, SEP:8, OCT:9, NOV:10, DEC:11 };
+const MONTH_FULL = ['january','february','march','april','may','june',
+                    'july','august','september','october','november','december'];
+const DAY_LABELS  = ['MON','TUES','WED','THUR','FRI'];
+const DAY_BLOCK_STARTS  = [0, 6, 12, 18, 24];   // col where each day-block starts
+const DATE_COL_OFFSETS  = [6, 12, 18, 24, 30];  // col in header row holding the day-number
+
+// Activity types we care about in faculty schedule
+const FAC_KEEP = new Set(['FMC','CA','OMT','COGAC','DERM']);
+
+// Resident suffix patterns to SKIP entirely
+const RES_SKIP_SUFFIXES = /\b(POP|PTO|NHR|ADMIN|HV|WILLOW|US|LARC|SPORTS MED|COLPO|TCM|FMS)\b/i;
+
+// Resident activity types from suffix
+const RES_SPECIAL = ['OMT','COGAC','DERM','WI'];
+
+// Faculty who are in clinic but need NO room and NO MA (e.g. SKB)
+const FACULTY_NO_MA = new Set(['SKB']);
+
+// Names that appear in the RESIDENT schedule but are actually faculty
+// (treated as FMC faculty: own room + 1 MA each)
+const PSEUDO_FACULTY_SET = new Set(['puckett', 'shen']);
+
+// ═══════════════════════════════════════════════════════════════════
+//  UTILITY
+// ═══════════════════════════════════════════════════════════════════
+function fmtDate(d) {
+  return d.toLocaleDateString('en-US', { weekday:'long', month:'short', day:'numeric', year:'numeric' });
+}
+function fmtShort(d) {
+  return d.toLocaleDateString('en-US', { weekday:'short', month:'short', day:'numeric' });
+}
+function isoKey(d) {
+  return d.toISOString().slice(0, 10);
+}
+function readFileAsArray(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = e => res(new Uint8Array(e.target.result));
+    r.onerror = rej;
+    r.readAsArrayBuffer(file);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FACULTY XLS PARSER
+//  Format: 4-week grid; week header rows identified by col-3 === 'MON'
+//  Each day is a 6-col block; left slot: col+1 (init), col+2 (activity)
+//                              right slot: col+4 (init), col+5 (activity)
+//  GLD: divider row separates AM from PM
+//  Faculty legend near bottom: col-0 = initials, col-1 = "Last, First" full name
+// ═══════════════════════════════════════════════════════════════════
+function parseFacultyXLS(workbook) {
+  const sh = workbook.Sheets[workbook.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json(sh, { header:1, raw:false, defval:'' });
+  const rows = raw.map(r => {
+    const out = [];
+    for (let c = 0; c <= 31; c++) out.push(String(r[c] ?? '').trim());
+    return out;
+  });
+
+  // Extract block year and start month from title row
+  let year = new Date().getFullYear();
+  let startMonth = 0;
+  for (const row of rows) {
+    // e.g. "BLOCK #10: MAR 8 to APR 4, 2026" or "BLOCK #9: FEB 8 - MAR 7, 2026"
+    const m = row.join(' ').match(/([A-Z]{3})\s+\d+\s+(?:to|[-–]+)\s+[A-Z]{3}\s+\d+,?\s*(\d{4})/i);
+    if (m) {
+      const mk = m[1].toUpperCase().slice(0,3);
+      startMonth = MONTH_MAP[mk] ?? 0;
+      year = parseInt(m[2]);
+      break;
+    }
+  }
+
+  // Find week header rows (col 3 === 'MON')
+  const weekHeaderRows = rows.reduce((acc, r, i) => {
+    if (r[3] === 'MON') acc.push(i);
+    return acc;
+  }, []);
+
+  // Build date map per week, handling month rollovers
+  const weekDateMaps = [];
+  let currentMonth = startMonth;
+  let lastDay = 0;
+  for (const hr of weekHeaderRows) {
+    const dateMap = {};
+    for (let di = 0; di < 5; di++) {
+      const dayNum = parseInt(rows[hr][DATE_COL_OFFSETS[di]]) || 0;
+      if (dayNum > 0) {
+        if (dayNum < lastDay) currentMonth = (currentMonth + 1) % 12;
+        lastDay = dayNum;
+        dateMap[DAY_LABELS[di]] = new Date(year, currentMonth, dayNum);
+      }
+    }
+    weekDateMaps.push(dateMap);
+  }
+
+  // Extract faculty name legend from rows after the last week (short initials → full name)
+  const namesMap = {};
+  const legendStart = (weekHeaderRows[weekHeaderRows.length - 1] || 0) + 20;
+  for (let r = legendStart; r < rows.length; r++) {
+    const init = rows[r][0];
+    const full = rows[r][1];
+    if (init && full && init.length >= 2 && init.length <= 5 && full.length > 4) {
+      // Clean up "Last, First M." → "Last, First"
+      namesMap[init] = full.replace(/,\s*[A-Z]\.?\s*$/, '').trim();
+    }
+  }
+
+  // Extract clinic sessions per half-day
+  const sessions = [];
+  const seen = new Set();
+
+  for (let wi = 0; wi < weekHeaderRows.length; wi++) {
+    const hr = weekHeaderRows[wi];
+    const nextHr = weekHeaderRows[wi + 1] ?? rows.length;
+    const dateMap = weekDateMaps[wi];
+
+    // Find GLD: divider row (marks end of AM, start of PM)
+    let divRow = -1;
+    for (let r = hr + 1; r < nextHr; r++) {
+      if (rows[r][0].toUpperCase().startsWith('GLD:') || rows[r][31].toUpperCase().startsWith('GLD:')) {
+        divRow = r; break;
+      }
+    }
+
+    for (let r = hr + 1; r < nextHr; r++) {
+      if (r === divRow) continue;
+      const half = (divRow >= 0 && r > divRow) ? 'PM' : 'AM';
+      const row = rows[r];
+
+      for (let di = 0; di < 5; di++) {
+        const d = dateMap[DAY_LABELS[di]];
+        if (!d) continue;
+        const bs = DAY_BLOCK_STARTS[di];
+
+        // Left slot: col+1 (init), col+2 (activity)
+        // Right slot: col+4 (init), col+5 (activity)
+        for (const [fi, ai] of [[bs+1, bs+2], [bs+4, bs+5]]) {
+          const fac = row[fi];
+          const actRaw = row[ai];
+          if (!fac || !actRaw) continue;
+
+          const act = actRaw.toUpperCase().trim();
+          let type = null;
+          if (act.startsWith('CA')) type = 'CA';
+          else if (act === 'FMC' || act === 'FMC-WI') type = 'FMC';
+          else if (FAC_KEEP.has(act)) type = act;
+          if (!type) continue;
+
+          const dk = isoKey(d);
+          const key = `${dk}_${half}_${fac}_${type}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          sessions.push({ date: d, dateKey: dk, dayLabel: DAY_LABELS[di],
+                          faculty: fac, type, session: half });
+        }
+      }
+    }
+  }
+
+  return { sessions, namesMap };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RESIDENT XLS PARSER
+//  Same grid format as faculty; resident name at col+1 (left) and col+5 (right)
+//  Activity embedded in name: "Sherman - OMT", "Thind (MXM)", "Olarinde- MJDH"
+//  Divider row: first row after header where col-0 starts with 'NHR' or 'Sports'
+// ═══════════════════════════════════════════════════════════════════
+function parseResidentEntry(raw) {
+  if (!raw) return null;
+  const text = raw.trim();
+  if (!text) return null;
+
+  // Skip obvious non-names
+  if (/^(NHR|PTO:|US$|TCM$|HV:|FMS|NOTES?:)/i.test(text)) return null;
+  if (/^[A-Z]{2,6}$/.test(text) && text.length <= 5) return null; // looks like code only
+
+  // Check for hard-skip suffixes
+  if (RES_SKIP_SUFFIXES.test(text)) return null;
+
+  // Check for DERM (case-insensitive suffix)
+  const dermMatch = text.match(/^(.+?)\s*[-–]+\s*[Dd][Ee][Rr][Mm]\s*$/);
+  if (dermMatch) return { name: dermMatch[1].trim(), type: 'DERM' };
+
+  // Check for known special types in suffix
+  for (const spec of ['COGAC', 'OMT', 'WI']) {
+    const re = new RegExp(`^(.+?)\\s*[-–]+\\s*${spec}\\s*$`, 'i');
+    const m = text.match(re);
+    if (m) return { name: m[1].trim(), type: spec };
+  }
+
+  // Parenthetical supervisor codes like (MXM), (CDO) → FMC
+  const parenMatch = text.match(/^(.+?)\s*\([A-Z]{2,5}\)\s*$/);
+  if (parenMatch) return { name: parenMatch[1].trim(), type: 'FMC' };
+
+  // Dash-separated supervisor codes (3-4 capital letters) → FMC
+  const dashSupMatch = text.match(/^(.+?)\s*[-–]+\s*([A-Z]{3,5})\s*$/);
+  if (dashSupMatch) {
+    const suffix = dashSupMatch[2].toUpperCase();
+    if (['OMT','COGAC','DERM','WI','FMC'].includes(suffix)) {
+      return { name: dashSupMatch[1].trim(), type: suffix };
+    }
+    // Supervisor code → FMC
+    return { name: dashSupMatch[1].trim(), type: 'FMC' };
+  }
+
+  // Plain name → FMC
+  if (text.length > 1) return { name: text, type: 'FMC' };
+  return null;
+}
+
+function parseResidentXLS(workbook) {
+  const sh = workbook.Sheets[workbook.SheetNames[0]];
+  const raw = XLSX.utils.sheet_to_json(sh, { header:1, raw:false, defval:'' });
+  const rows = raw.map(r => {
+    const out = [];
+    for (let c = 0; c <= 31; c++) out.push(String(r[c] ?? '').trim());
+    return out;
+  });
+
+  // Extract year/start month from title row (same logic as faculty)
+  // Resident files use dash: "FEB 8 - MAR 7, 2026"; faculty files use "to"
+  let year = new Date().getFullYear();
+  let startMonth = 0;
+  for (const row of rows) {
+    const m = row.join(' ').match(/([A-Z]{3})\s+\d+\s+(?:to|[-–]+)\s+[A-Z]{3}\s+\d+,?\s*(\d{4})/i);
+    if (m) {
+      startMonth = MONTH_MAP[m[1].toUpperCase().slice(0,3)] ?? 0;
+      year = parseInt(m[2]);
+      break;
+    }
+  }
+
+  // Find week header rows
+  const weekHeaderRows = rows.reduce((acc, r, i) => {
+    if (r[3] === 'MON') acc.push(i);
+    return acc;
+  }, []);
+
+  // Build date maps (same rollover logic)
+  const weekDateMaps = [];
+  let currentMonth = startMonth;
+  let lastDay = 0;
+  for (const hr of weekHeaderRows) {
+    const dateMap = {};
+    for (let di = 0; di < 5; di++) {
+      const dayNum = parseInt(rows[hr][DATE_COL_OFFSETS[di]]) || 0;
+      if (dayNum > 0) {
+        if (dayNum < lastDay) currentMonth = (currentMonth + 1) % 12;
+        lastDay = dayNum;
+        dateMap[DAY_LABELS[di]] = new Date(year, currentMonth, dayNum);
+      }
+    }
+    weekDateMaps.push(dateMap);
+  }
+
+  const sessions = [];
+  const seen = new Set();
+
+  for (let wi = 0; wi < weekHeaderRows.length; wi++) {
+    const hr = weekHeaderRows[wi];
+    const nextHr = weekHeaderRows[wi + 1] ?? rows.length;
+    const dateMap = weekDateMaps[wi];
+
+    // Find AM/PM divider: first blank row OR any row containing NHR/Sports anywhere
+    // Block 9: NHR/Sports notes appear at cols 13, 19, 25 (not col 0/3)
+    // Block 10: divider is a completely blank row
+    let divRow = -1;
+    for (let r = hr + 1; r < nextHr; r++) {
+      const rowJoined = rows[r].join(' ').toUpperCase();
+      const isBlank = !rows[r].some(v => v.trim());
+      const hasNHR = rowJoined.includes('NHR') || rowJoined.includes('SPORTS');
+      if (isBlank || hasNHR) { divRow = r; break; }
+    }
+
+    for (let r = hr + 1; r < nextHr; r++) {
+      if (r === divRow) continue;
+      const half = (divRow >= 0 && r > divRow) ? 'PM' : 'AM';
+      const row = rows[r];
+
+      for (let di = 0; di < 5; di++) {
+        const d = dateMap[DAY_LABELS[di]];
+        if (!d) continue;
+        const bs = DAY_BLOCK_STARTS[di];
+
+        // Left slot: col+1, Right slot: col+5
+        for (const ci of [bs+1, bs+5]) {
+          const entry = parseResidentEntry(row[ci]);
+          if (!entry) continue;
+          const dk = isoKey(d);
+          const key = `${dk}_${half}_${entry.name}_${entry.type}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          sessions.push({ date: d, dateKey: dk, name: entry.name,
+                          type: entry.type, session: half });
+        }
+      }
+    }
+  }
+
+  return sessions;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MA AVAILABILITY XLSX PARSER
+//  Format: 4-week sections identified by "Week N" header rows.
+//  Each section:
+//   - Week header row: col 0 = "Week N", cols 1,3,5,7,9 = Excel date serials (Mon–Fri)
+//   - Optional specialty notes row
+//   - Slot header row: cols 1-10 = "Mon AM","Mon PM","Tue AM",..."Fri PM"
+//   - "Providers" row (provider counts — skip)
+//   - MA rows: col 0 = first name, cols 1-10 = W/OFF per slot
+//   - Summary rows: "MAs Scheduled:", "MAs Required:", "Difference:"
+// ═══════════════════════════════════════════════════════════════════
+function parseMAAvailability(workbook) {
+  const sh = workbook.Sheets[workbook.SheetNames[0]];
+  const NC = 21;
+
+  // String read: for names and W/OFF values (non-breaking spaces stripped)
+  const rowsStr = XLSX.utils.sheet_to_json(sh, { header:1, raw:false, defval:'' })
+    .map(r => { const o=[]; for(let c=0;c<NC;c++) o.push(String(r[c]??'').replace(/\xa0/g,' ').trim()); return o; });
+
+  // Raw numeric read: for date serial extraction
+  const rowsRaw = XLSX.utils.sheet_to_json(sh, { header:1, raw:true, defval:'' })
+    .map(r => { const o=[]; for(let c=0;c<NC;c++) o.push(r[c]??''); return o; });
+
+  const result = {}; // "YYYY-MM-DD_AM" | "YYYY-MM-DD_PM" → [maName, ...]
+
+  // Convert Excel date serial to ISO string; returns null if not a plausible date
+  const xls2iso = n => {
+    if (typeof n !== 'number' || n < 40000 || n > 62000) return null;
+    return new Date(Math.round((n - 25569) * 86400 * 1000)).toISOString().slice(0, 10);
+  };
+
+  // A slot cell counts as "working" if it starts with W (e.g. "W", "W 0815", "w 1430", "W1500")
+  const isW = v => /^w/i.test(String(v).trim());
+
+  const SKIP = /^(providers?|mas?\s*(scheduled|required)|difference|total|ft$|prn$)/i;
+
+  let i = 0;
+  while (i < rowsStr.length) {
+    // Look for week header row: col 0 = "Week 1", "Week 2", etc.
+    if (!/^week\s*\d/i.test(rowsStr[i][0])) { i++; continue; }
+
+    // Extract Mon–Fri dates from Excel date serials at 0-indexed cols 1,3,5,7,9
+    const weekDates = [1, 3, 5, 7, 9].map(c => xls2iso(rowsRaw[i][c]));
+    i++; // advance past the week header
+
+    let foundSlotHeader = false;
+
+    while (i < rowsStr.length) {
+      const row = rowsStr[i];
+      const cell0 = row[0];
+
+      // Stop when we hit the next week header
+      if (/^week\s*\d/i.test(cell0)) break;
+
+      // Detect the slot header row: cols 1–10 contain "Mon AM", "Mon PM", … "Fri PM"
+      // (at least 8 of the 10 cells must include "AM" or "PM")
+      const slotCells = row.slice(1, 11).map(c => c.toUpperCase());
+      if (slotCells.filter(c => c.includes('AM') || c.includes('PM')).length >= 8) {
+        foundSlotHeader = true;
+        i++; continue;
+      }
+
+      // Skip blank rows, Providers row, and summary rows
+      if (!cell0 || SKIP.test(cell0)) { i++; continue; }
+
+      // After the slot header, every non-skipped row is an MA row
+      if (foundSlotHeader) {
+        const maName = cell0;
+        for (let s = 0; s < 10; s++) {
+          if (!isW(row[s + 1])) continue;
+          const dayIdx = Math.floor(s / 2);        // 0=Mon … 4=Fri
+          const session = s % 2 === 0 ? 'AM' : 'PM';
+          const dk = weekDates[dayIdx];
+          if (!dk) continue;
+          const key = `${dk}_${session}`;
+          if (!result[key]) result[key] = [];
+          if (!result[key].includes(maName)) result[key].push(maName);
+        }
+      }
+
+      i++;
+    }
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  STUDENT PDF PARSER  (uses PDF.js for text extraction)
+//  Format: monthly calendar PDF; cells contain "AM: FMC w/ [provider]"
+//  Provider = faculty initials (SNG) or resident last name (Thind)
+// ═══════════════════════════════════════════════════════════════════
+async function parseStudentPDF(file) {
+  if (typeof pdfjsLib === 'undefined') {
+    throw new Error('PDF.js library not loaded. Check your internet connection.');
+  }
+
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
+
+  let studentName = file.name.replace(/\.pdf$/i, '').replace(/[-_]/g, ' ');
+  let foundMonth = null;
+  let foundYear = null;
+  const entries = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const textContent = await page.getTextContent();
+
+    // Collect all text items with positions (keep fractional coords for accuracy)
+    const items = textContent.items
+      .map(item => ({
+        text: item.str.trim(),
+        x: item.transform[4],
+        y: item.transform[5],
+      }))
+      .filter(item => item.text.length > 0);
+
+    const fullText = items.map(i => i.text).join(' ');
+
+    // Extract student name: take the first two words from the PDF
+    // (sorted top→bottom, left→right). The student's own schedule always
+    // starts with their name, so this works regardless of school format.
+    const topItems = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
+    if (topItems.length >= 2) {
+      studentName = `${topItems[0].text} ${topItems[1].text}`.trim();
+    }
+
+    // FIX 1: Extract month and year with SEPARATE regexes.
+    // The date header looks like "February 1- February 28, 2026" so the month name
+    // never directly precedes the year — they need independent matches.
+    const monthRe = new RegExp(`\\b(${MONTH_FULL.join('|')})\\b`, 'i');
+    const mM = fullText.match(monthRe);
+    const mY = fullText.match(/\b(20\d{2})\b/);
+    if (mM && foundMonth === null) foundMonth = MONTH_FULL.indexOf(mM[1].toLowerCase());
+    if (mY && foundYear === null) foundYear = parseInt(mY[1]);
+    if (foundMonth === null || foundMonth < 0 || foundYear === null) continue;
+
+    // Sort items by y DESC (top of page = highest y in PDF coords), then x ASC
+    const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
+
+    // FIX 2: Group items into proximity-based y-bands.
+    // Items whose consecutive |Δy| ≤ 4 px are on the same visual line.
+    // This is more robust than fixed row-height buckets.
+    const bands = [];
+    for (const item of sorted) {
+      const lastBand = bands[bands.length - 1];
+      if (lastBand && Math.abs(lastBand[lastBand.length - 1].y - item.y) <= 4) {
+        lastBand.push(item);
+      } else {
+        bands.push([item]);
+      }
+    }
+
+    // Find calendar header band: contains 5+ day-name words (Sun/Mon/Tue…)
+    const DAY_NAME_RE = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat|Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$/i;
+    let headerBandIdx = -1;
+    let colBounds = null;
+    for (let bi = 0; bi < bands.length; bi++) {
+      const dayItems = bands[bi].filter(it => DAY_NAME_RE.test(it.text));
+      if (dayItems.length >= 5) {
+        headerBandIdx = bi;
+        const byX = [...dayItems].sort((a, b) => a.x - b.x);
+        // colBounds[i].hx = the x of the header item (used as reference for date mapping)
+        colBounds = byX.map((h, idx) => ({
+          day: h.text.slice(0, 3).toUpperCase(),
+          xMin: idx === 0 ? -Infinity : (byX[idx - 1].x + h.x) / 2,
+          xMax: idx === byX.length - 1 ? Infinity : (h.x + byX[idx + 1].x) / 2,
+          hx: h.x,
+        }));
+        break;
+      }
+    }
+    if (!colBounds || headerBandIdx < 0) continue;
+
+    // colDateMap[colIdx] = day-of-month for that column (updated row by row)
+    const colDateMap = {};
+
+    for (let bi = headerBandIdx + 1; bi < bands.length; bi++) {
+      const band = bands[bi];
+
+      // ── Date row detection ──────────────────────────────────────────
+      // A date row has 4+ items that are 1-2 digit integers in [1, 31].
+      const dateNums = band.filter(it =>
+        /^\d{1,2}$/.test(it.text) && parseInt(it.text) >= 1 && parseInt(it.text) <= 31
+      );
+
+      if (dateNums.length >= 4) {
+        // FIX 2 (date mapping): Date numbers in this PDF are positioned at the
+        // RIGHT EDGE of their column, so their x falls inside the NEXT column's
+        // bounds. Fix: for each date number, find the nearest column header (hx),
+        // then shift one column to the LEFT (actualCol = bestCol - 1).
+        for (const dn of dateNums) {
+          let bestCol = 0, bestDist = Infinity;
+          for (let ci = 0; ci < colBounds.length; ci++) {
+            const dist = Math.abs(dn.x - colBounds[ci].hx);
+            if (dist < bestDist) { bestDist = dist; bestCol = ci; }
+          }
+          const actualCol = Math.max(0, bestCol - 1);
+          colDateMap[actualCol] = parseInt(dn.text);
+        }
+        continue; // date rows have no schedule content
+      }
+
+      // ── Content row ─────────────────────────────────────────────────
+      // Group items by their column (using standard x-in-bounds check;
+      // content items ARE correctly positioned within their column).
+      const byCol = {};
+      for (const item of band) {
+        for (let ci = 0; ci < colBounds.length; ci++) {
+          if (item.x >= colBounds[ci].xMin && item.x < colBounds[ci].xMax) {
+            if (!byCol[ci]) byCol[ci] = [];
+            byCol[ci].push(item.text);
+            break;
+          }
+        }
+      }
+
+      for (const [ciStr, texts] of Object.entries(byCol)) {
+        const ci = parseInt(ciStr);
+        const dayNum = colDateMap[ci];
+        if (!dayNum) continue;
+
+        const cellText = texts.join(' ');
+
+        // FIX 3: Some tokens appear before the session marker, e.g. "WI PM: FMC w/ SLS".
+        // Use a word-boundary search (\b) instead of line-start (^) to find AM/PM.
+        // Regex captures: session (AM|PM), provider name (first word after "w/")
+        const fmcRe = /\b(AM|PM)\s*:\s*FMC\s+[Ww]\/\s*([A-Za-z][A-Za-z\-\.]+)/g;
+        let m;
+        while ((m = fmcRe.exec(cellText)) !== null) {
+          const provider = m[2].trim().replace(/\s*[-–(].*$/, '').trim();
+          if (provider) {
+            const date = new Date(foundYear, foundMonth, dayNum);
+            entries.push({
+              dateKey: isoKey(date),
+              session: m[1].toUpperCase(),
+              pairedWith: provider,
+              student: studentName,
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Deduplicate
+  const seen = new Set();
+  return {
+    studentName,
+    entries: entries.filter(e => {
+      const k = `${e.dateKey}_${e.session}_${e.pairedWith}_${e.student}`;
+      return seen.has(k) ? false : (seen.add(k), true);
+    }),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SCHEDULE BUILDER
+//  Combines all parsed data into per-half-day slot objects with
+//  MA counts, availability, paired rooms, students, and conflicts
+// ═══════════════════════════════════════════════════════════════════
+function buildSchedule(facultySessions, residentSessions, maAvailability,
+                       studentEntries, nursePreferences) {
+
+  // Build per-slot maps
+  const slotMap = {}; // dateKey_session → slot data
+
+  const getSlot = (dateKey, session, date) => {
+    const k = `${dateKey}_${session}`;
+    if (!slotMap[k]) {
+      slotMap[k] = {
+        dateKey, session, date,
+        fmcFaculty: [],      // faculty doing FMC (each needs 1 MA)
+        caFaculty: [],       // CA attendings (0 MA, supervise residents)
+        noRoomFaculty: [],   // in clinic but no room or MA needed (e.g. SKB)
+        omtFaculty: [],      // OMT faculty (pair with OMT resident)
+        cogacFaculty: [],    // COGAC faculty
+        dermFaculty: [],     // DERM faculty
+        omtResidents: [],    // OMT residents
+        cogacResidents: [],  // COGAC residents
+        dermResidents: [],   // DERM residents
+        fmcResidents: [],    // Regular FMC/WI residents (each needs 1 MA)
+        students: [],        // Med students with their providers
+      };
+    }
+    return slotMap[k];
+  };
+
+  // Populate faculty
+  for (const s of facultySessions) {
+    const slot = getSlot(s.dateKey, s.session, s.date);
+    if (FACULTY_NO_MA.has(s.faculty)) slot.noRoomFaculty.push(s.faculty); // e.g. SKB: in clinic, no room/MA
+    else if (s.type === 'FMC') slot.fmcFaculty.push(s.faculty);
+    else if (s.type === 'CA') slot.caFaculty.push(s.faculty);
+    else if (s.type === 'OMT') slot.omtFaculty.push(s.faculty);
+    else if (s.type === 'COGAC') slot.cogacFaculty.push(s.faculty);
+    else if (s.type === 'DERM') slot.dermFaculty.push(s.faculty);
+  }
+
+  // Populate residents
+  for (const s of residentSessions) {
+    const slot = getSlot(s.dateKey, s.session, s.date);
+    if (PSEUDO_FACULTY_SET.has(s.name.toLowerCase())) {
+      // Shen and Puckett appear in the resident file but are faculty
+      // → own FMC room + 1 MA, counted as faculty
+      slot.fmcFaculty.push(s.name);
+    } else if (s.type === 'OMT') slot.omtResidents.push(s.name);
+    else if (s.type === 'COGAC') slot.cogacResidents.push(s.name);
+    else if (s.type === 'DERM') slot.dermResidents.push(s.name);
+    else slot.fmcResidents.push(s.name); // FMC, WI → regular residents
+  }
+
+  // Populate students
+  for (const e of studentEntries) {
+    const key = `${e.dateKey}_${e.session}`;
+    if (!slotMap[key]) continue; // Only add students to existing clinic slots
+    slotMap[key].students.push({ name: e.student, pairedWith: e.pairedWith });
+  }
+
+  // Build final slot objects with paired rooms, MA counts, and conflicts
+  const slots = [];
+
+  for (const slot of Object.values(slotMap)) {
+    const conflicts = [];
+
+    // ── Paired rooms: match faculty with residents ──
+    const omtPairs = [];
+    const maxOmt = Math.max(slot.omtFaculty.length, slot.omtResidents.length);
+    for (let i = 0; i < maxOmt; i++) {
+      const fac = slot.omtFaculty[i] || null;
+      const res = slot.omtResidents[i] || null;
+      omtPairs.push({ faculty: fac, resident: res });
+      if (!fac) conflicts.push({ type: 'ROOM_MISMATCH', severity: 'warning',
+        msg: `OMT resident "${res}" has no matching OMT faculty this ${slot.session}` });
+      if (!res) conflicts.push({ type: 'ROOM_MISMATCH', severity: 'warning',
+        msg: `OMT faculty "${fac}" has no matching OMT resident this ${slot.session}` });
+    }
+
+    const cogacPairs = [];
+    const maxCogac = Math.max(slot.cogacFaculty.length, slot.cogacResidents.length);
+    for (let i = 0; i < maxCogac; i++) {
+      const fac = slot.cogacFaculty[i] || null;
+      const res = slot.cogacResidents[i] || null;
+      cogacPairs.push({ faculty: fac, resident: res });
+      if (!fac) conflicts.push({ type: 'ROOM_MISMATCH', severity: 'warning',
+        msg: `COGAC resident "${res}" has no matching COGAC faculty this ${slot.session}` });
+      if (!res) conflicts.push({ type: 'ROOM_MISMATCH', severity: 'warning',
+        msg: `COGAC faculty "${fac}" has no matching COGAC resident this ${slot.session}` });
+    }
+
+    const dermPairs = [];
+    const maxDerm = Math.max(slot.dermFaculty.length, slot.dermResidents.length);
+    for (let i = 0; i < maxDerm; i++) {
+      const fac = slot.dermFaculty[i] || null;
+      const res = slot.dermResidents[i] || null;
+      dermPairs.push({ faculty: fac, resident: res });
+      if (!fac) conflicts.push({ type: 'ROOM_MISMATCH', severity: 'warning',
+        msg: `DERM resident "${res}" has no matching DERM faculty this ${slot.session}` });
+      if (!res) conflicts.push({ type: 'ROOM_MISMATCH', severity: 'warning',
+        msg: `DERM faculty "${fac}" has no matching DERM resident this ${slot.session}` });
+    }
+
+    // ── MA count ──
+    // FMC faculty: 1 MA each
+    // Paired rooms (OMT/COGAC/DERM): 1 MA per pair (even if missing one side)
+    // FMC/WI residents: 1 MA each
+    // CA faculty: 0 MA
+    const masNeeded = slot.fmcFaculty.length
+      + omtPairs.length
+      + cogacPairs.length
+      + dermPairs.length
+      + slot.fmcResidents.length;
+
+    // ── Available MAs ──
+    const key = `${slot.dateKey}_${slot.session}`;
+    const masAvailable = maAvailability[key] || [];
+    const masAvailableCount = masAvailable.length;
+
+    // ── MA shortage ──
+    if (masAvailable.length > 0 && masAvailableCount < masNeeded) {
+      conflicts.push({ type: 'MA_SHORTAGE', severity: 'error',
+        msg: `MA shortage: ${masNeeded} needed, only ${masAvailableCount} available` +
+             ` (${masAvailable.join(', ')})` });
+    }
+
+    // ── Student conflicts ──
+    // Build set of all provider identifiers for this slot
+    // (faculty initials + resident last names, normalized to uppercase)
+    const allProviders = new Set([
+      ...slot.fmcFaculty,
+      ...slot.caFaculty,
+      ...slot.noRoomFaculty,
+      ...slot.omtFaculty,
+      ...slot.cogacFaculty,
+      ...slot.dermFaculty,
+      ...slot.fmcResidents,
+      ...slot.omtResidents,
+      ...slot.cogacResidents,
+      ...slot.dermResidents,
+    ].map(p => p.toUpperCase()));
+
+    // Check students
+    const providerStudentMap = {};
+    for (const s of slot.students) {
+      const provUpper = s.pairedWith.toUpperCase();
+      // Check if provider is present (fuzzy match: initials or last name)
+      const isPresent = [...allProviders].some(p =>
+        p === provUpper ||
+        p.startsWith(provUpper) ||
+        provUpper.startsWith(p)
+      );
+      if (!isPresent) {
+        conflicts.push({ type: 'STUDENT_NO_PROVIDER', severity: 'error',
+          msg: `Student "${s.name}" is scheduled with "${s.pairedWith}" but that provider is NOT in clinic this ${slot.session}` });
+      }
+      // Check for double-booking
+      if (!providerStudentMap[provUpper]) providerStudentMap[provUpper] = [];
+      providerStudentMap[provUpper].push(s.name);
+    }
+    for (const [prov, students] of Object.entries(providerStudentMap)) {
+      if (students.length > 1) {
+        conflicts.push({ type: 'STUDENT_DOUBLE_BOOK', severity: 'error',
+          msg: `Two students with same provider "${prov}": ${students.join(', ')}` });
+      }
+    }
+
+    // ── Nurse-doctor preference conflicts ──
+    for (const pref of nursePreferences) {
+      const nurseAvailable = masAvailable.some(ma =>
+        ma.toUpperCase().includes(pref.nurse.toUpperCase()) ||
+        pref.nurse.toUpperCase().includes(ma.toUpperCase()));
+      const doctorInClinic = [...allProviders].some(p =>
+        p.includes(pref.doctor.toUpperCase()) ||
+        pref.doctor.toUpperCase().includes(p));
+      if (nurseAvailable && doctorInClinic) {
+        conflicts.push({ type: 'NURSE_PREFERENCE', severity: 'warning',
+          msg: `"${pref.nurse}" (available) has a noted conflict with "${pref.doctor}" (in clinic)` });
+      }
+    }
+
+    slots.push({
+      dateKey: slot.dateKey,
+      date: slot.date,
+      session: slot.session,
+      fmcFaculty: slot.fmcFaculty,
+      caFaculty: slot.caFaculty,
+      noRoomFaculty: slot.noRoomFaculty,
+      omtPairs,
+      cogacPairs,
+      dermPairs,
+      fmcResidents: slot.fmcResidents,
+      students: slot.students,
+      masNeeded,
+      masAvailable,
+      masAvailableCount,
+      conflicts,
+    });
+  }
+
+  return slots.sort((a, b) => {
+    const dk = a.dateKey.localeCompare(b.dateKey);
+    if (dk !== 0) return dk;
+    return a.session === 'AM' ? -1 : 1;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  EXCEL EXPORT
+// ═══════════════════════════════════════════════════════════════════
+function exportToExcel(slots, namesMap) {
+  const wb = XLSX.utils.book_new();
+  const fn = init => namesMap[init] ? `${namesMap[init]} (${init})` : init;
+
+  // Sheet 1: Half-day briefing
+  const rows = [
+    ['Date', 'Session', 'Type', 'Provider', 'MAs Needed', 'MAs Available (count)',
+     'Available MAs', 'Students', 'Conflicts']
+  ];
+
+  for (const slot of slots) {
+    const dateFmt = fmtShort(slot.date);
+    const maAvailStr = slot.masAvailable.join(', ') || '(not provided)';
+    const conflictStr = slot.conflicts.map(c => c.msg).join('; ') || '';
+
+    // FMC Faculty
+    for (const f of slot.fmcFaculty) {
+      const studs = slot.students.filter(s => s.pairedWith.toUpperCase() === f.toUpperCase() ||
+        fn(f).toUpperCase().includes(s.pairedWith.toUpperCase()));
+      rows.push([dateFmt, slot.session, 'FMC Faculty', fn(f),
+        slot.masNeeded, slot.masAvailableCount, maAvailStr,
+        studs.map(s => s.name).join(', '), conflictStr]);
+    }
+    // CA Faculty
+    for (const f of slot.caFaculty) {
+      rows.push([dateFmt, slot.session, 'CA (Supervisor)', fn(f),
+        '', '', '', '', '']);
+    }
+    // No-Room / No-MA Faculty (e.g. SKB)
+    for (const f of (slot.noRoomFaculty || [])) {
+      rows.push([dateFmt, slot.session, 'In Clinic (no room/MA)', fn(f),
+        '', '', '', '', '']);
+    }
+    // OMT Pairs
+    for (const p of slot.omtPairs) {
+      rows.push([dateFmt, slot.session, 'OMT Room',
+        `Faculty: ${fn(p.faculty || '?')} / Resident: ${p.resident || '?'}`,
+        '', '', '', '', '']);
+    }
+    // COGAC Pairs
+    for (const p of slot.cogacPairs) {
+      rows.push([dateFmt, slot.session, 'COGAC Room',
+        `Faculty: ${fn(p.faculty || '?')} / Resident: ${p.resident || '?'}`,
+        '', '', '', '', '']);
+    }
+    // DERM Pairs
+    for (const p of slot.dermPairs) {
+      rows.push([dateFmt, slot.session, 'DERM Room',
+        `Faculty: ${fn(p.faculty || '?')} / Resident: ${p.resident || '?'}`,
+        '', '', '', '', '']);
+    }
+    // FMC Residents
+    for (const r of slot.fmcResidents) {
+      const studs = slot.students.filter(s =>
+        s.pairedWith.toUpperCase().includes(r.toUpperCase()) ||
+        r.toUpperCase().includes(s.pairedWith.toUpperCase()));
+      rows.push([dateFmt, slot.session, 'FMC Resident', r,
+        '', '', '', studs.map(s => s.name).join(', '), '']);
+    }
+    // MA summary row
+    rows.push([dateFmt, slot.session, '── MA SUMMARY ──',
+      `Needed: ${slot.masNeeded} | Available: ${slot.masAvailableCount} | ${slot.masAvailableCount >= slot.masNeeded ? 'OK' : 'SHORTAGE'}`,
+      slot.masNeeded, slot.masAvailableCount, maAvailStr, '', conflictStr]);
+    rows.push([]); // blank separator
+  }
+
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  ws['!cols'] = [14,8,18,40,10,12,40,30,60].map(w => ({ wch: w }));
+
+  // Style header row (XLSX.js doesn't support cell styles in community edition, but we set bold)
+  XLSX.utils.book_append_sheet(wb, ws, 'Half-Day Briefing');
+
+  // Sheet 2: MA availability summary
+  const maRows = [['Date', 'Session', 'MAs Needed', 'MAs Available', 'Available Names', 'Status']];
+  for (const slot of slots) {
+    const hasData = slot.masAvailable.length > 0;
+    maRows.push([
+      fmtShort(slot.date),
+      slot.session,
+      slot.masNeeded,
+      hasData ? slot.masAvailableCount : 'N/A',
+      hasData ? slot.masAvailable.join(', ') : '(not provided)',
+      !hasData ? 'N/A' : slot.masAvailableCount >= slot.masNeeded ? '✓ OK' : '⚠ SHORTAGE',
+    ]);
+  }
+  const ws2 = XLSX.utils.aoa_to_sheet(maRows);
+  ws2['!cols'] = [14,8,10,12,45,12].map(w => ({ wch: w }));
+  XLSX.utils.book_append_sheet(wb, ws2, 'MA Summary');
+
+  // Sheet 3: Conflicts only
+  const confRows = [['Date', 'Session', 'Severity', 'Issue']];
+  for (const slot of slots) {
+    for (const c of slot.conflicts) {
+      confRows.push([fmtShort(slot.date), slot.session, c.severity.toUpperCase(), c.msg]);
+    }
+  }
+  if (confRows.length > 1) {
+    const ws3 = XLSX.utils.aoa_to_sheet(confRows);
+    ws3['!cols'] = [14,8,10,80].map(w => ({ wch: w }));
+    XLSX.utils.book_append_sheet(wb, ws3, 'Conflicts');
+  }
+
+  XLSX.writeFile(wb, 'clinic-schedule-briefing.xlsx');
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  REACT COMPONENTS
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Colors / design tokens ──
+const C = {
+  FMC:   { bg:'#DBEAFE', bd:'#93C5FD', tx:'#1D4ED8' },
+  CA:    { bg:'#D1FAE5', bd:'#6EE7B7', tx:'#065F46' },
+  OMT:   { bg:'#FEF3C7', bd:'#FCD34D', tx:'#92400E' },
+  COGAC: { bg:'#F3E8FF', bd:'#C084FC', tx:'#6B21A8' },
+  DERM:  { bg:'#FCE7F3', bd:'#F9A8D4', tx:'#9D174D' },
+  RES:   { bg:'#FEE2E2', bd:'#FCA5A5', tx:'#991B1B' },
+  STU:   { bg:'#F0FDF4', bd:'#86EFAC', tx:'#166534' },
+  MA:    { bg:'#F0F9FF', bd:'#7DD3FC', tx:'#075985' },
+};
+
+function Chip({ color='#6366F1', bg='#EEF2FF', label, size=11 }) {
+  return (
+    <span style={{ background:bg, color, border:`1px solid ${color}33`,
+      padding:'2px 8px', borderRadius:99, fontSize:size, fontWeight:700,
+      whiteSpace:'nowrap', display:'inline-block' }}>
+      {label}
+    </span>
+  );
+}
+
+function ConflictTag({ conflict }) {
+  const isError = conflict.severity === 'error';
+  return (
+    <div style={{ background: isError ? '#FEF2F2' : '#FFFBEB',
+      border: `1px solid ${isError ? '#FECACA' : '#FDE68A'}`,
+      color: isError ? '#B91C1C' : '#92400E',
+      borderRadius:6, padding:'5px 10px', fontSize:12, marginTop:4, display:'flex', gap:6 }}>
+      <span>{isError ? '🚨' : '⚠️'}</span>
+      <span>{conflict.msg}</span>
+    </div>
+  );
+}
+
+function FileDropZone({ label, file, onFile, accept, multiple=false }) {
+  const ref = useRef();
+  const handleDrop = useCallback(e => {
+    e.preventDefault();
+    const files = [...(e.dataTransfer.files || [])];
+    if (multiple) { files.forEach(f => onFile(f)); }
+    else if (files[0]) onFile(files[0]);
+  }, [multiple, onFile]);
+
+  return (
+    <div onDragOver={e=>e.preventDefault()} onDrop={handleDrop}
+      onClick={() => ref.current.click()}
+      style={{ border:`2px dashed ${file ? '#6366F1' : '#CBD5E1'}`,
+        borderRadius:10, padding:'18px 12px', textAlign:'center',
+        cursor:'pointer', background: file ? '#EEF2FF' : '#F8FAFC',
+        transition:'all .15s', minHeight:80 }}>
+      <input ref={ref} type="file" accept={accept} multiple={multiple}
+        style={{ display:'none' }}
+        onChange={e => {
+          const files = [...e.target.files];
+          if (multiple) files.forEach(f => onFile(f));
+          else if (files[0]) onFile(files[0]);
+          e.target.value = '';
+        }} />
+      <div style={{ fontSize:22, marginBottom:4 }}>{file ? '✅' : '📂'}</div>
+      <div style={{ fontWeight:700, fontSize:13, color: file ? '#4F46E5' : '#64748B' }}>
+        {file ? (typeof file === 'string' ? file : file.name) : label}
+      </div>
+      <div style={{ fontSize:11, color:'#94A3B8', marginTop:2 }}>
+        {file ? 'Click to replace' : 'Click or drag & drop'}
+      </div>
+    </div>
+  );
+}
+
+// ── Provider card used inside session cards ──
+function ProviderCard({ color, label, name, resident, students }) {
+  return (
+    <div style={{ background:'white', borderRadius:8, padding:'9px 11px',
+      border:`1.5px solid ${color.bd}`, minWidth:0 }}>
+      <div style={{ display:'flex', alignItems:'center', gap:5, marginBottom:resident ? 3 : 0, flexWrap:'wrap' }}>
+        <Chip color={color.tx} bg={color.bg} label={label} />
+        <span style={{ fontWeight:700, fontSize:13 }}>{name}</span>
+        {students && students.length > 0 && (
+          <span style={{ fontSize:11, color:'#166534', fontStyle:'italic', fontWeight:500 }}>
+            🎓 ({students.map(s => s.name).join(', ')})
+          </span>
+        )}
+      </div>
+      {resident && (
+        <div style={{ fontSize:12, color:'#64748B' }}>
+          👩‍⚕️ Resident: <strong>{resident}</strong>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SessionCard({ slot, namesMap }) {
+  const fn = init => namesMap[init] ? `${namesMap[init]} (${init})` : init;
+  const bg = slot.session === 'AM' ? '#FFFBEB' : '#EEF2FF';
+  const bd = slot.session === 'AM' ? '#FDE68A' : '#C7D2FE';
+  const hasConflicts = slot.conflicts.length > 0;
+  const hasError = slot.conflicts.some(c => c.severity === 'error');
+
+  const allProviders = new Set([
+    ...slot.fmcFaculty,
+    ...slot.caFaculty,
+    ...(slot.noRoomFaculty || []),
+    ...slot.omtPairs.map(p => p.faculty).filter(Boolean),
+    ...slot.cogacPairs.map(p => p.faculty).filter(Boolean),
+    ...slot.dermPairs.map(p => p.faculty).filter(Boolean),
+    ...slot.fmcResidents,
+    ...slot.omtPairs.map(p => p.resident).filter(Boolean),
+    ...slot.cogacPairs.map(p => p.resident).filter(Boolean),
+    ...slot.dermPairs.map(p => p.resident).filter(Boolean),
+  ].map(p => p.toUpperCase()));
+
+  const studentsForProvider = (providerInit) => {
+    return slot.students.filter(s => {
+      const pUp = s.pairedWith.toUpperCase();
+      const fUp = fn(providerInit).toUpperCase();
+      return pUp === providerInit.toUpperCase() || fUp.includes(pUp);
+    });
+  };
+
+  const studentsForResident = (resName) => {
+    return slot.students.filter(s =>
+      resName.toUpperCase().includes(s.pairedWith.toUpperCase()) ||
+      s.pairedWith.toUpperCase().includes(resName.toUpperCase())
+    );
+  };
+
+  // Students with no matching provider in this slot
+  const orphanedStudents = slot.students.filter(s => {
+    const pUp = s.pairedWith.toUpperCase();
+    return ![...allProviders].some(p => p === pUp || p.startsWith(pUp) || pUp.startsWith(p));
+  });
+
+  const maStatus = slot.masAvailable.length === 0
+    ? 'unknown'
+    : slot.masAvailableCount >= slot.masNeeded ? 'ok' : 'shortage';
+
+  return (
+    <div style={{ background:bg, border:`1.5px solid ${bd}`, borderRadius:10,
+      padding:'12px 14px', marginBottom:8,
+      ...(hasConflicts ? { boxShadow:`0 0 0 2px ${hasError ? '#FCA5A5' : '#FDE68A'}` } : {}) }}>
+
+      {/* Session header */}
+      <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:10, flexWrap:'wrap' }}>
+        <span style={{ background: slot.session==='AM' ? '#F59E0B' : '#6366F1',
+          color:'white', borderRadius:6, padding:'3px 12px', fontSize:13, fontWeight:800 }}>
+          {slot.session==='AM' ? '☀️ AM' : '🌙 PM'}
+        </span>
+        <span style={{ fontSize:12, color:'#64748B' }}>
+          {slot.fmcFaculty.length + slot.omtPairs.length + slot.cogacPairs.length + slot.dermPairs.length + slot.caFaculty.length + (slot.noRoomFaculty||[]).length} faculty · {slot.fmcResidents.length + slot.omtPairs.length + slot.cogacPairs.length + slot.dermPairs.length} residents · {slot.students.length} students
+        </span>
+
+        {/* MA status badge */}
+        <span style={{ marginLeft:'auto',
+          background: maStatus==='unknown' ? '#F1F5F9' : maStatus==='ok' ? '#D1FAE5' : '#FEE2E2',
+          color: maStatus==='unknown' ? '#475569' : maStatus==='ok' ? '#065F46' : '#B91C1C',
+          border: `1px solid ${maStatus==='unknown' ? '#CBD5E1' : maStatus==='ok' ? '#6EE7B7' : '#FCA5A5'}`,
+          borderRadius:99, padding:'2px 10px', fontSize:12, fontWeight:700 }}>
+          {maStatus==='unknown'
+            ? `MAs: ${slot.masNeeded} needed`
+            : maStatus==='ok'
+            ? `✓ ${slot.masAvailableCount} MAs (need ${slot.masNeeded})`
+            : `⚠ ${slot.masAvailableCount}/${slot.masNeeded} MAs`}
+        </span>
+      </div>
+
+      {/* Provider grid */}
+      <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(240px,1fr))', gap:7 }}>
+
+        {/* FMC Faculty */}
+        {slot.fmcFaculty.map((f,i) => (
+          <ProviderCard key={'fmc'+i} color={C.FMC} label="FMC"
+            name={fn(f)} students={studentsForProvider(f)} />
+        ))}
+
+        {/* CA Faculty */}
+        {slot.caFaculty.map((f,i) => (
+          <div key={'ca'+i} style={{ background:'white', borderRadius:8, padding:'9px 11px',
+            border:`1.5px solid ${C.CA.bd}` }}>
+            <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+              <Chip color={C.CA.tx} bg={C.CA.bg} label="CA Supervisor" />
+              <span style={{ fontWeight:700, fontSize:13 }}>{fn(f)}</span>
+            </div>
+          </div>
+        ))}
+
+        {/* No-Room / No-MA Faculty (e.g. SKB) */}
+        {(slot.noRoomFaculty||[]).map((f,i) => (
+          <div key={'noroom'+i} style={{ background:'white', borderRadius:8, padding:'9px 11px',
+            border:`1.5px dashed #CBD5E1` }}>
+            <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+              <Chip color='#475569' bg='#F1F5F9' label="In Clinic" />
+              <span style={{ fontWeight:700, fontSize:13 }}>{fn(f)}</span>
+            </div>
+            <div style={{ fontSize:11, color:'#94A3B8', marginTop:2 }}>No room · No MA</div>
+          </div>
+        ))}
+
+        {/* OMT Pairs */}
+        {slot.omtPairs.map((p,i) => (
+          <ProviderCard key={'omt'+i} color={C.OMT} label="OMT Room"
+            name={fn(p.faculty || '?')} resident={p.resident || '—'} />
+        ))}
+
+        {/* COGAC Pairs */}
+        {slot.cogacPairs.map((p,i) => (
+          <ProviderCard key={'cogac'+i} color={C.COGAC} label="COGAC"
+            name={fn(p.faculty || '?')} resident={p.resident || '—'} />
+        ))}
+
+        {/* DERM Pairs */}
+        {slot.dermPairs.map((p,i) => (
+          <ProviderCard key={'derm'+i} color={C.DERM} label="DERM"
+            name={fn(p.faculty || '?')} resident={p.resident || '—'} />
+        ))}
+
+        {/* FMC Residents */}
+        {slot.fmcResidents.map((r,i) => (
+          <ProviderCard key={'res'+i} color={C.RES} label="Resident"
+            name={r} students={studentsForResident(r)} />
+        ))}
+
+        {/* Orphaned students (provider not found in clinic) */}
+        {orphanedStudents.map((s,i) => (
+          <div key={'stu'+i} style={{ background:'white', borderRadius:8, padding:'9px 11px',
+            border:`1.5px solid #FCA5A5`, opacity:.8 }}>
+            <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+              <Chip color='#B91C1C' bg='#FEE2E2' label="Student ⚠" />
+              <span style={{ fontWeight:700, fontSize:13 }}>{s.name}</span>
+            </div>
+            <div style={{ fontSize:12, color:'#B91C1C', marginTop:2 }}>
+              with "{s.pairedWith}" — not in clinic
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* MA Available section — always visible */}
+      <div style={{ marginTop:10, background:'white', borderRadius:8, padding:'8px 12px',
+        border:`1px solid ${C.MA.bd}` }}>
+        <div style={{ fontSize:12, fontWeight:700, color:C.MA.tx, marginBottom:4 }}>
+          🩺 Available MAs ({slot.masAvailableCount} available · {slot.masNeeded} needed):
+        </div>
+        {slot.masAvailable.length > 0 ? (
+          <div style={{ display:'flex', flexWrap:'wrap', gap:5 }}>
+            {slot.masAvailable.map(ma => (
+              <span key={ma} style={{ background:C.MA.bg, color:C.MA.tx,
+                border:`1px solid ${C.MA.bd}`, borderRadius:99, padding:'2px 9px',
+                fontSize:12, fontWeight:600 }}>{ma}</span>
+            ))}
+          </div>
+        ) : (
+          <span style={{ fontSize:12, color:'#94A3B8', fontStyle:'italic' }}>
+            Upload MA schedule to see available MAs
+          </span>
+        )}
+      </div>
+
+      {/* Conflicts */}
+      {slot.conflicts.length > 0 && (
+        <div style={{ marginTop:10 }}>
+          {slot.conflicts.map((c, i) => <ConflictTag key={i} conflict={c} />)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MAIN APP
+// ═══════════════════════════════════════════════════════════════════
+function App() {
+  const [step, setStep] = useState('upload');   // upload | prefs | view
+  const [loading, setLoading] = useState(false);
+  const [loadingMsg, setLoadingMsg] = useState('');
+  const [error, setError] = useState('');
+
+  // Files
+  const [facFile, setFacFile] = useState(null);
+  const [resFile, setResFile] = useState(null);
+  const [maFile, setMaFile] = useState(null);
+  const [studentFiles, setStudentFiles] = useState([]); // array of Files
+
+  // Preferences
+  const [prefNurse, setPrefNurse] = useState('');
+  const [prefDoctor, setPrefDoctor] = useState('');
+  const [preferences, setPreferences] = useState([]); // [{nurse, doctor}]
+
+  // Results
+  const [schedule, setSchedule] = useState(null);
+  const [namesMap, setNamesMap] = useState({});
+  const [expandedDates, setExpandedDates] = useState({});
+  const [filterDate, setFilterDate] = useState('');
+
+  const addStudentFile = useCallback(f => {
+    setStudentFiles(prev => prev.some(p => p.name === f.name) ? prev : [...prev, f]);
+  }, []);
+  const removeStudentFile = name => setStudentFiles(prev => prev.filter(f => f.name !== name));
+
+  const addPreference = () => {
+    const n = prefNurse.trim(), d = prefDoctor.trim();
+    if (!n || !d) return;
+    if (preferences.some(p => p.nurse === n && p.doctor === d)) return;
+    setPreferences(prev => [...prev, { nurse: n, doctor: d }]);
+    setPrefNurse(''); setPrefDoctor('');
+  };
+  const removePref = (nurse, doctor) =>
+    setPreferences(prev => prev.filter(p => !(p.nurse === nurse && p.doctor === doctor)));
+
+  const handleProcess = async () => {
+    if (!facFile && !resFile) {
+      setError('Please upload at least a Faculty or Resident schedule file.'); return;
+    }
+    setError(''); setLoading(true); setLoadingMsg('Reading faculty schedule…');
+
+    try {
+      let facultySessions = [];
+      let localNamesMap = {};
+
+      if (facFile) {
+        const data = await readFileAsArray(facFile);
+        const wb = XLSX.read(data, { type:'array' });
+        const parsed = parseFacultyXLS(wb);
+        facultySessions = parsed.sessions;
+        localNamesMap = parsed.namesMap;
+        setNamesMap(localNamesMap);
+      }
+
+      let residentSessions = [];
+      if (resFile) {
+        setLoadingMsg('Reading resident schedule…');
+        const data = await readFileAsArray(resFile);
+        const wb = XLSX.read(data, { type:'array' });
+        residentSessions = parseResidentXLS(wb);
+      }
+
+      let maAvailability = {};
+      if (maFile) {
+        setLoadingMsg('Reading MA availability…');
+        const data = await readFileAsArray(maFile);
+        const wb = XLSX.read(data, { type:'array' });
+        maAvailability = parseMAAvailability(wb);
+      }
+
+      let studentEntries = [];
+      if (studentFiles.length > 0) {
+        for (const sf of studentFiles) {
+          setLoadingMsg(`Parsing student PDF: ${sf.name}…`);
+          try {
+            const parsed = await parseStudentPDF(sf);
+            studentEntries = [...studentEntries, ...parsed.entries];
+          } catch (pdfErr) {
+            console.warn('PDF parse error for', sf.name, pdfErr);
+            setError(prev => `${prev || ''}Warning: Could not fully parse ${sf.name}: ${pdfErr.message}. `);
+          }
+        }
+      }
+
+      setLoadingMsg('Building schedule…');
+      const slots = buildSchedule(facultySessions, residentSessions,
+                                  maAvailability, studentEntries, preferences);
+
+      if (slots.length === 0) {
+        setError('No clinic sessions found in the uploaded files. Please check that the files are in the expected format.');
+        setLoading(false); return;
+      }
+
+      setSchedule(slots);
+      // Auto-expand first 3 dates
+      const firstDates = [...new Set(slots.map(s => s.dateKey))].slice(0, 3);
+      setExpandedDates(Object.fromEntries(firstDates.map(d => [d, true])));
+      setStep('view');
+    } catch (err) {
+      setError('Error processing files: ' + err.message);
+      console.error(err);
+    }
+    setLoading(false); setLoadingMsg('');
+  };
+
+  // Group slots by date
+  const byDate = useMemo(() => {
+    if (!schedule) return {};
+    const map = {};
+    for (const slot of schedule) {
+      if (!map[slot.dateKey]) map[slot.dateKey] = { date: slot.date, slots: [] };
+      map[slot.dateKey].slots.push(slot);
+    }
+    return map;
+  }, [schedule]);
+
+  const sortedDates = useMemo(() =>
+    Object.keys(byDate).sort().filter(dk => !filterDate || dk === filterDate),
+    [byDate, filterDate]);
+
+  const totalConflicts = useMemo(() =>
+    schedule ? schedule.reduce((n, s) => n + s.conflicts.length, 0) : 0,
+    [schedule]);
+
+  const totalErrors = useMemo(() =>
+    schedule ? schedule.reduce((n, s) =>
+      n + s.conflicts.filter(c => c.severity === 'error').length, 0) : 0,
+    [schedule]);
+
+  return (
+    <div style={{ minHeight:'100vh', background:'#F1F5F9' }}>
+
+      {/* ── HEADER ── */}
+      <div style={{ background:'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+        color:'white', padding:'16px 28px', display:'flex', alignItems:'center', gap:12,
+        boxShadow:'0 2px 10px rgba(79,70,229,.35)' }}>
+        <span style={{ fontSize:26 }}>🏥</span>
+        <div>
+          <div style={{ fontSize:19, fontWeight:800 }}>FMC Clinic Scheduler</div>
+          <div style={{ fontSize:12, opacity:.75 }}>Upload schedules → view half-day MA needs & conflicts</div>
+        </div>
+        {schedule && (
+          <div style={{ marginLeft:'auto', display:'flex', gap:8 }}>
+            <button onClick={() => setStep('upload')}
+              style={{ background:'rgba(255,255,255,.15)', color:'white', border:'1px solid rgba(255,255,255,.3)',
+                borderRadius:8, padding:'8px 14px', fontSize:13, cursor:'pointer' }}>
+              ↩ Re-upload
+            </button>
+            <button onClick={() => exportToExcel(schedule, namesMap)}
+              style={{ background:'#10B981', color:'white', border:'none',
+                borderRadius:8, padding:'8px 16px', fontSize:13, fontWeight:700, cursor:'pointer' }}>
+              ⬇ Export Excel
+            </button>
+          </div>
+        )}
+      </div>
+
+      <div style={{ maxWidth:1100, margin:'0 auto', padding:'22px 16px' }}>
+
+        {/* ─────────────────── UPLOAD STEP ─────────────────── */}
+        {step === 'upload' && (
+          <div style={{ background:'white', borderRadius:14, padding:28,
+            boxShadow:'0 1px 6px rgba(0,0,0,.07)' }}>
+            <h2 style={{ fontSize:18, fontWeight:800, marginBottom:4 }}>Step 1 of 2 — Upload Files</h2>
+            <p style={{ color:'#64748B', fontSize:14, marginBottom:22 }}>
+              Upload the block schedule files. Only the Faculty or Resident schedule is required;
+              the rest add more detail to the output.
+            </p>
+
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16, marginBottom:16 }}>
+              {/* Faculty */}
+              <div>
+                <label style={{ fontSize:13, fontWeight:700, display:'block', marginBottom:6 }}>
+                  📋 Faculty Block Schedule <span style={{ color:'#EF4444' }}>*</span>
+                </label>
+                <FileDropZone label="Faculty schedule (.xls / .xlsx)" file={facFile}
+                  onFile={setFacFile} accept=".xls,.xlsx" />
+                <div style={{ fontSize:11, color:'#94A3B8', marginTop:4, lineHeight:1.5 }}>
+                  <strong style={{ color:'#64748B' }}>Format:</strong> .xls or .xlsx &nbsp;·&nbsp;
+                  4-week rotation grid from the scheduling system<br/>
+                  Columns represent activity types: FMC, CA, OMT, COGAC, DERM
+                </div>
+              </div>
+
+              {/* Resident */}
+              <div>
+                <label style={{ fontSize:13, fontWeight:700, display:'block', marginBottom:6 }}>
+                  👩‍⚕️ Resident Block Schedule <span style={{ color:'#EF4444' }}>*</span>
+                </label>
+                <FileDropZone label="Resident schedule (.xls / .xlsx)" file={resFile}
+                  onFile={setResFile} accept=".xls,.xlsx" />
+                <div style={{ fontSize:11, color:'#94A3B8', marginTop:4, lineHeight:1.5 }}>
+                  <strong style={{ color:'#64748B' }}>Format:</strong> .xls or .xlsx &nbsp;·&nbsp;
+                  Same 4-week grid as faculty<br/>
+                  Each cell contains the resident name + activity suffix (e.g. Smith-FMC)
+                </div>
+              </div>
+
+              {/* MA Availability */}
+              <div>
+                <label style={{ fontSize:13, fontWeight:700, display:'block', marginBottom:6 }}>
+                  🩺 MA Availability <span style={{ color:'#94A3B8', fontWeight:400 }}>(optional)</span>
+                </label>
+                <FileDropZone label="MA availability (.xlsx)" file={maFile}
+                  onFile={setMaFile} accept=".xlsx" />
+                <div style={{ fontSize:11, color:'#94A3B8', marginTop:4, lineHeight:1.5 }}>
+                  <strong style={{ color:'#64748B' }}>Format:</strong> .xlsx &nbsp;·&nbsp;
+                  Weekly availability sheet<br/>
+                  Cells contain <strong style={{ color:'#64748B' }}>W</strong> (working) or <strong style={{ color:'#64748B' }}>OFF</strong> for each AM/PM slot
+                </div>
+              </div>
+
+              {/* Student PDFs */}
+              <div>
+                <label style={{ fontSize:13, fontWeight:700, display:'block', marginBottom:6 }}>
+                  🎓 Student Schedules <span style={{ color:'#94A3B8', fontWeight:400 }}>(optional)</span>
+                </label>
+                <FileDropZone label="Drop student PDFs here — one per student, multiple OK" file={studentFiles.length > 0 ? `${studentFiles.length} PDF(s) added` : null}
+                  onFile={addStudentFile} accept=".pdf" multiple />
+                <div style={{ fontSize:11, color:'#94A3B8', marginTop:4, lineHeight:1.5 }}>
+                  <strong style={{ color:'#64748B' }}>Format:</strong> .pdf &nbsp;·&nbsp;
+                  Monthly calendar PDF, one file per student<br/>
+                  The student's name is read from the top of the PDF automatically
+                </div>
+                {studentFiles.length > 0 && (
+                  <div style={{ marginTop:6, display:'flex', flexWrap:'wrap', gap:5 }}>
+                    {studentFiles.map(f => (
+                      <span key={f.name} style={{ background:'#EEF2FF', color:'#4F46E5',
+                        borderRadius:99, padding:'2px 10px', fontSize:11, display:'flex',
+                        alignItems:'center', gap:4 }}>
+                        {f.name}
+                        <button onClick={() => removeStudentFile(f.name)}
+                          style={{ background:'none', border:'none', cursor:'pointer',
+                            color:'#818CF8', padding:0, fontSize:13, lineHeight:1 }}>×</button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {error && (
+              <div style={{ background:'#FEF2F2', border:'1px solid #FECACA', borderRadius:8,
+                padding:'10px 14px', color:'#B91C1C', fontSize:13, marginBottom:14 }}>
+                ⚠️ {error}
+              </div>
+            )}
+
+            <div style={{ display:'flex', justifyContent:'flex-end' }}>
+              <button onClick={() => setStep('prefs')} disabled={!facFile && !resFile}
+                style={{ background:'#6366F1', color:'white', border:'none', borderRadius:10,
+                  padding:'11px 26px', fontSize:15, fontWeight:700, cursor:'pointer' }}>
+                Next: Nurse Preferences →
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ─────────────────── PREFERENCES STEP ─────────────────── */}
+        {step === 'prefs' && (
+          <div style={{ background:'white', borderRadius:14, padding:28,
+            boxShadow:'0 1px 6px rgba(0,0,0,.07)' }}>
+            <h2 style={{ fontSize:18, fontWeight:800, marginBottom:4 }}>Step 2 of 2 — Nurse Preferences</h2>
+            <p style={{ color:'#64748B', fontSize:14, marginBottom:22 }}>
+              Enter any nurse/MA ↔ doctor pairs where the nurse has declined to work with
+              that doctor. The app will flag these in the schedule when both are present.
+              This step is optional — skip if none apply.
+            </p>
+
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr auto', gap:10,
+              alignItems:'end', marginBottom:16 }}>
+              <div>
+                <label style={{ fontSize:12, fontWeight:700, display:'block', marginBottom:5 }}>
+                  Nurse / MA Name
+                </label>
+                <input value={prefNurse} onChange={e => setPrefNurse(e.target.value)}
+                  placeholder="e.g. Avery"
+                  onKeyDown={e => e.key === 'Enter' && addPreference()}
+                  style={{ width:'100%', padding:'9px 12px', border:'1.5px solid #E2E8F0',
+                    borderRadius:8, fontSize:14, outline:'none' }} />
+              </div>
+              <div>
+                <label style={{ fontSize:12, fontWeight:700, display:'block', marginBottom:5 }}>
+                  Doctor / Provider Name or Initials
+                </label>
+                <input value={prefDoctor} onChange={e => setPrefDoctor(e.target.value)}
+                  placeholder="e.g. SNG or Sherman"
+                  onKeyDown={e => e.key === 'Enter' && addPreference()}
+                  style={{ width:'100%', padding:'9px 12px', border:'1.5px solid #E2E8F0',
+                    borderRadius:8, fontSize:14, outline:'none' }} />
+              </div>
+              <button onClick={addPreference} disabled={!prefNurse.trim() || !prefDoctor.trim()}
+                style={{ background:'#6366F1', color:'white', border:'none', borderRadius:8,
+                  padding:'9px 18px', fontWeight:700, cursor:'pointer', fontSize:14 }}>
+                + Add
+              </button>
+            </div>
+
+            {preferences.length > 0 && (
+              <div style={{ background:'#F8FAFC', borderRadius:8, padding:12,
+                border:'1px solid #E2E8F0', marginBottom:20 }}>
+                <div style={{ fontSize:12, fontWeight:700, color:'#475569', marginBottom:8 }}>
+                  Preference Conflicts ({preferences.length}):
+                </div>
+                {preferences.map((p, i) => (
+                  <div key={i} style={{ display:'flex', alignItems:'center', gap:8,
+                    padding:'4px 0', borderBottom: i < preferences.length-1 ? '1px solid #F1F5F9' : 'none' }}>
+                    <span style={{ fontSize:13 }}>🚫 <strong>{p.nurse}</strong> will not work with <strong>{p.doctor}</strong></span>
+                    <button onClick={() => removePref(p.nurse, p.doctor)}
+                      style={{ marginLeft:'auto', background:'none', border:'none',
+                        cursor:'pointer', color:'#94A3B8', fontSize:16 }}>×</button>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            <div style={{ display:'flex', justifyContent:'space-between' }}>
+              <button onClick={() => setStep('upload')}
+                style={{ background:'none', border:'1.5px solid #E2E8F0', borderRadius:8,
+                  padding:'10px 20px', fontSize:14, cursor:'pointer', color:'#64748B' }}>
+                ← Back
+              </button>
+              <button onClick={handleProcess} disabled={loading}
+                style={{ background:'#6366F1', color:'white', border:'none', borderRadius:10,
+                  padding:'11px 26px', fontSize:15, fontWeight:700, cursor:'pointer' }}>
+                {loading
+                  ? <><span className="spin">⏳</span> {loadingMsg || 'Processing…'}</>
+                  : '✨ Generate Schedule'}
+              </button>
+            </div>
+
+            {error && (
+              <div style={{ background:'#FEF2F2', border:'1px solid #FECACA', borderRadius:8,
+                padding:'10px 14px', color:'#B91C1C', fontSize:13, marginTop:14 }}>
+                ⚠️ {error}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ─────────────────── SCHEDULE VIEW ─────────────────── */}
+        {step === 'view' && schedule && (
+          <>
+            {/* Stats bar */}
+            <div style={{ background:'white', borderRadius:12, padding:'12px 20px',
+              boxShadow:'0 1px 4px rgba(0,0,0,.06)', marginBottom:12,
+              display:'flex', gap:24, alignItems:'center', flexWrap:'wrap' }}>
+              {[
+                ['Clinic Days', Object.keys(byDate).length],
+                ['Half-Day Slots', schedule.length],
+                ['Conflicts', totalConflicts],
+                ['Errors', totalErrors],
+              ].map(([lbl, val]) => (
+                <div key={lbl}>
+                  <div style={{ fontSize:10, color:'#94A3B8', fontWeight:700, textTransform:'uppercase', letterSpacing:'.05em' }}>{lbl}</div>
+                  <div style={{ fontSize:22, fontWeight:800, color: lbl==='Errors' && val > 0 ? '#B91C1C' : lbl==='Conflicts' && val > 0 ? '#92400E' : '#4F46E5' }}>
+                    {val}
+                  </div>
+                </div>
+              ))}
+
+              {/* Date filter */}
+              <div style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:8 }}>
+                <select value={filterDate} onChange={e => setFilterDate(e.target.value)}
+                  style={{ padding:'6px 10px', border:'1.5px solid #E2E8F0', borderRadius:8,
+                    fontSize:13, background:'white', cursor:'pointer' }}>
+                  <option value="">All Dates</option>
+                  {Object.keys(byDate).sort().map(dk => (
+                    <option key={dk} value={dk}>{fmtShort(byDate[dk].date)}</option>
+                  ))}
+                </select>
+                <button onClick={() => exportToExcel(schedule, namesMap)}
+                  style={{ background:'#10B981', color:'white', border:'none', borderRadius:8,
+                    padding:'7px 16px', fontSize:13, fontWeight:700, cursor:'pointer' }}>
+                  ⬇ Export
+                </button>
+              </div>
+            </div>
+
+            {/* Error notification banner */}
+            {totalErrors > 0 && (
+              <div style={{ background:'#FEF2F2', border:'1px solid #FECACA', borderRadius:10,
+                padding:'10px 16px', color:'#B91C1C', fontSize:13, marginBottom:10,
+                display:'flex', alignItems:'center', gap:8 }}>
+                🚨 <strong>{totalErrors} scheduling error{totalErrors!==1?'s':''}</strong> detected.
+                See flagged sessions below. Expand each day card to view details.
+              </div>
+            )}
+
+            {/* Legend */}
+            <div style={{ background:'white', borderRadius:10, padding:'8px 14px',
+              boxShadow:'0 1px 3px rgba(0,0,0,.05)', marginBottom:10,
+              display:'flex', gap:10, flexWrap:'wrap', alignItems:'center' }}>
+              <span style={{ fontSize:11, fontWeight:700, color:'#475569' }}>Legend:</span>
+              {[
+                { label:'FMC (faculty)', ...C.FMC },
+                { label:'CA Supervisor', ...C.CA },
+                { label:'OMT Room', ...C.OMT },
+                { label:'COGAC', ...C.COGAC },
+                { label:'DERM', ...C.DERM },
+                { label:'Resident', ...C.RES },
+              ].map(c => (
+                <span key={c.label} style={{ display:'flex', alignItems:'center', gap:4,
+                  fontSize:11, color:c.tx }}>
+                  <span style={{ width:9, height:9, borderRadius:2, background:c.bg,
+                    border:`1px solid ${c.bd}`, display:'inline-block' }} />
+                  {c.label}
+                </span>
+              ))}
+            </div>
+
+            {/* Date accordion */}
+            {sortedDates.map(dk => {
+              const day = byDate[dk];
+              const isOpen = !!expandedDates[dk];
+              const dayConflicts = day.slots.reduce((n, s) => n + s.conflicts.length, 0);
+              const dayErrors = day.slots.reduce((n, s) =>
+                n + s.conflicts.filter(c => c.severity === 'error').length, 0);
+
+              return (
+                <div key={dk} style={{ background:'white', borderRadius:12, marginBottom:7,
+                  boxShadow:'0 1px 4px rgba(0,0,0,.06)', overflow:'hidden',
+                  ...(dayErrors > 0 ? { border:'1.5px solid #FCA5A5' } :
+                      dayConflicts > 0 ? { border:'1.5px solid #FDE68A' } : {}) }}>
+
+                  {/* Date header (click to expand) */}
+                  <div onClick={() => setExpandedDates(p => ({ ...p, [dk]: !p[dk] }))}
+                    style={{ padding:'12px 18px', cursor:'pointer', display:'flex',
+                      alignItems:'center', gap:10, userSelect:'none',
+                      background: isOpen ? '#F5F3FF' : 'white' }}>
+                    <span style={{ fontSize:16 }}>{isOpen ? '▾' : '▸'}</span>
+                    <div style={{ flex:1 }}>
+                      <div style={{ fontWeight:800, fontSize:15 }}>{fmtDate(day.date)}</div>
+                      <div style={{ fontSize:12, color:'#64748B', marginTop:1 }}>
+                        {day.slots.map(s => {
+                          const total = s.fmcFaculty.length + s.omtPairs.length +
+                            s.cogacPairs.length + s.dermPairs.length;
+                          return `${s.session}: ${total} faculty · ${s.fmcResidents.length + s.omtPairs.length + s.cogacPairs.length + s.dermPairs.length} residents`;
+                        }).join('  ·  ')}
+                      </div>
+                    </div>
+
+                    <div style={{ display:'flex', alignItems:'center', gap:6 }}>
+                      {dayErrors > 0 && (
+                        <Chip color='#B91C1C' bg='#FEE2E2' label={`🚨 ${dayErrors} error${dayErrors!==1?'s':''}`} />
+                      )}
+                      {dayConflicts > dayErrors && (
+                        <Chip color='#92400E' bg='#FFFBEB' label={`⚠ ${dayConflicts - dayErrors} warning${dayConflicts-dayErrors!==1?'s':''}`} />
+                      )}
+                      {day.slots.map(s => {
+                        const maStatus = s.masAvailable.length === 0 ? null
+                          : s.masAvailableCount >= s.masNeeded ? 'ok' : 'short';
+                        return (
+                          <span key={s.session} style={{
+                            background: s.session==='AM' ? '#FEF3C7' : '#EEF2FF',
+                            color: s.session==='AM' ? '#92400E' : '#4F46E5',
+                            border: `1px solid ${s.session==='AM' ? '#FCD34D' : '#C7D2FE'}`,
+                            padding:'2px 8px', borderRadius:99, fontSize:11, fontWeight:700 }}>
+                            {s.session}
+                            {maStatus === 'short' && ' ⚠'}
+                            {maStatus === 'ok' && ' ✓'}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Expanded content */}
+                  {isOpen && (
+                    <div style={{ padding:'4px 14px 14px' }}>
+                      {day.slots.map(slot => (
+                        <SessionCard key={slot.session} slot={slot} namesMap={namesMap} />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {sortedDates.length === 0 && (
+              <div style={{ background:'white', borderRadius:12, padding:32, textAlign:'center',
+                color:'#94A3B8', fontSize:15 }}>
+                No dates match the current filter.
+              </div>
+            )}
+          </>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
